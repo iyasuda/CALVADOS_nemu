@@ -592,6 +592,302 @@ class RNA(Component):
             for r in self.restr_pairlist:
                 f.write(f'{int(r[0])} {int(r[1])} {r[2]:.4f} {r[3]:.4f}\n')
 
+
+class DNA(Component):
+    """ Component DNA. """
+
+    def __init__(self, name: str, comp_dict: dict, defaults: dict):
+        super().__init__(name, comp_dict, defaults)
+
+    def calc_x_from_pdb(self):
+        """ Calculate DNA positions from pdb. """
+        input_pdb = f'{self.pdb_folder}/{self.name}.pdb'
+        self.xinit, self.dimensions = build.geometry_from_pdb_rna(input_pdb,use_com=self.use_com) # read from pdb
+
+    def calc_ssdomains(self):
+        """ Get bounds for restraints (harmonic). """
+        seq_ssdomains = build.get_ssdomains(self.name,self.fdomains)
+        ssdomains_bead = []
+        for seq_ssdomain in seq_ssdomains:
+            ss_domain_bead = []
+            for s in seq_ssdomain:
+                ss_domain_bead.append(2*s)
+                ss_domain_bead.append(2*s+1)
+            ssdomains_bead.append(ss_domain_bead)
+        self.ssdomains = ssdomains_bead
+        #print(self.ssdomains)
+        # print(f'Setting {self.restraint_type} restraints for {comp.name}')
+
+    def calc_properties(self, pH: float = 7.0, verbose: bool = False, comp_setup: str = 'spiral'):
+        """ Calculate component properties (sigmas, lambdas, qs etc.) """
+
+        self.calc_comp_seq() # --> seq and seq2
+        self.nres = len(self.seq)
+        self.nbeads = len(self.seq2)
+
+        self.sigmas = np.array([self.residues.loc[s].sigmas for s in self.seq2])
+        self.lambdas = np.array([self.residues.loc[s].lambdas for s in self.seq2])
+        self.bondlengths = np.array([self.residues.loc[s].bondlength for s in self.seq2])
+        self.mws = np.array([self.residues.loc[s].MW for s in self.seq2])
+        self.qs, _ = get_qs(self.seq2,flexhis=True,pH=pH,residues=self.residues)
+        self.alphas = self.lambdas*self.alpha
+
+        if self.restraint:
+            self.calc_x_from_pdb()
+            self.calc_dmap()
+            self.calc_angmap()
+            if self.restraint_type == 'harmonic':
+                self.calc_ssdomains()
+            #elif self.restraint_type == 'go':
+            #    self.calc_go_scale()
+        else:
+            self.calc_x_setup(comp_setup=comp_setup, d=0.59, n_per_res=2)
+
+        self.init_bond_force()
+        self.init_angle_force()
+
+    def init_bond_force(self):
+        self.bond_pairlist = []
+        self.hb = interactions.init_bonded_interactions()
+        self.basebase_pairlist = []
+        self.scLJ_dna = interactions.init_scaled_LJ(self.eps_lj,self.rna_nb_cutoff)
+
+    def init_angle_force(self):
+        self.angle_list = []
+        self.ha = interactions.init_angles()
+
+    def get_forces(self):
+        self.forces = [self.hb, self.scLJ_dna, self.ha]
+        if self.restraint:
+            self.forces.append(self.cs)
+
+    def calc_comp_seq(self):
+        """ Calculate sequence of DNA. """
+
+        if self.restraint:
+            four_type_seq, n_termini_seq, c_termini_seq = seq_from_pdb(f'{self.pdb_folder}/{self.name}.pdb')
+            seq_0 = ''
+            seq_ssdomains = build.get_ssdomains(self.name,self.fdomains)
+            for i in range(len(four_type_seq)):
+                ss_residue_condition = any( i  in seq_ssdomain for seq_ssdomain in seq_ssdomains)
+                if ss_residue_condition:
+                    s = 'c' # strctured DNA
+                else:
+                    s = 'b' # unstructured DNA
+                seq_0 += s
+            self.seq = seq_0
+
+        else:
+            records = read_fasta(self.ffasta)
+            self.seq = str(records[self.name].seq) # one bead seq
+            n_termini_seq = [0]
+            c_termini_seq = [len(self.seq)-1]
+
+        self.seq2 = '' # two bead seq
+        for s in self.seq:
+            self.seq2 += f'a{s}'
+        self.n_termini = [x for i in n_termini_seq for x in (2*i, 2*i+1) ]
+        self.c_termini = [x for i in c_termini_seq for x in (2*i, 2*i+1)]
+
+
+    def calc_bondlength(self, i, j):
+        d0 = self.bondlengths[j] #0.5 * (self.bondlengths[i] + self.bondlengths[j])
+        if self.restraint:
+            if self.restraint_type == 'harmonic':
+                ss = build.check_ssdomain(self.ssdomains,i,j,req_both=False)
+                d = self.dmap[i,j] if ss else d0
+            #elif self.restraint_type == 'go':
+            #    d = self.bondscale[i,j] * d0 + (1. - self.bondscale[i,j]) * self.dmap[i,j]
+            else:
+                #raise ValueError("Restraint type must be harmonic or go.")
+                raise ValueError("Restraint type must be harmonic.")
+        else:
+            d = d0
+        return d
+
+    def calc_dna_nb_sigma_length(self, i, j):
+        sig0 = self.dna_nb_sigma
+        if self.restraint:
+            if self.restraint_type == 'harmonic':
+                ss = build.check_ssdomain(self.ssdomains,i,j,req_both=False)
+                sig = self.dmap[i,j]/(2**(1/6)) if ss else sig0
+            else:
+                #raise ValueError("Restraint type must be harmonic or go.")
+                raise ValueError("Restraint type must be harmonic.")
+        else:
+            sig = sig0
+        return sig
+
+    def calc_angmap(self):
+        N = len(self.xinit)
+        angmap = np.zeros((N))
+        pos = self.xinit
+        for i in range(0,N-4,2):
+            v1 = pos[i]-pos[i+2]
+            v2 = pos[i+4]-pos[i+2]
+            cos = np.dot(v1,v2)/np.linalg.norm(v1)/np.linalg.norm(v2)
+            angmap[i] = np.arccos(cos)
+        self.angmap = angmap
+
+    def calc_angle(self, i, j):
+        ang0 = self.dna_pa
+        if self.restraint:
+            if self.restraint_type == 'harmonic':
+                ss = build.check_ssdomain(self.ssdomains,i,j,req_both=False)
+                ang = self.angmap[i] if ss else ang0
+            else:
+                #raise ValueError("Restraint type must be harmonic or go.")
+                raise ValueError("Restraint type must be harmonic.")
+        else:
+            ang = ang0
+        return ang
+
+    def bond_check(self, i: int, j: int):
+        """ Define bonded term conditions. """
+
+        condition0 = (i%2 == 0) # phosphate
+        condition1 = (j == i+2) # phosphate -- phosphate
+        condition2 = (j == i+1) # phosphate -- base
+
+        condition = condition0 and (condition1 or condition2)
+
+        condition_termini =  not ( (i in self.c_termini) and (j in self.n_termini) )
+        return condition and condition_termini
+
+    def angle_check(self, i: int, j: int):
+        """ Define angle term conditions. """
+
+        condition = (i%2 == 0) and (j == i+4)
+        condition_termini =  (i+2 not in self.n_termini) and (i+2 not in self.c_termini)
+        return condition and condition_termini
+
+    def basebase_check(self, i: int, j: int):
+        """ Base-base interaction conditions. """
+
+        condition = (i%2 == 1) and (j == i+2)
+        condition_termini = not ( (i in self.c_termini) and (j in self.n_termini) )
+        return condition and condition_termini
+
+    def calc_x_setup(self, comp_setup: str = 'spiral', d: float = 0.59, n_per_res: int = 2):
+        if comp_setup == 'spiral':
+            self.xinit = build.build_spiral(self.bondlengths[1::2], arc=d, n_per_res=n_per_res)
+        else: # don't allow 'compact' setup for two-bead model
+            z_bondlengths = self.bondlengths[::2]
+            self.xinit = build.build_linear(z_bondlengths, n_per_res=n_per_res, ys=self.bondlengths)
+
+    def add_bonds(self, offset):
+        exclusion_map = []
+        for i in range(0, self.nbeads-1):
+            for j in range(i, self.nbeads):
+                if self.bond_check(i,j): # p-p and p-b
+                    d = self.calc_bondlength(i,j) #self.bondlengths[j]
+                    if j%2==0:
+                        dna_kb = self.dna_kb1
+                    else:
+                        dna_kb = self.dna_kb2
+                    bidx = self.hb.addBond(
+                        i+offset, j+offset, d*unit.nanometer,
+                        dna_kb*unit.kilojoules_per_mole/(unit.nanometer**2))
+                    exclusion_map.append([i+offset,j+offset])
+                    self.bond_pairlist.append([i+offset+1,j+offset+1,bidx,d,dna_kb])
+                if self.basebase_check(i,j): # restrain neighboring bases
+                    sig = self.calc_dna_nb_sigma_length(i,j) #self.dna_nb_sigma
+                    lam = (self.lambdas[i] + self.lambdas[j]) / 2.
+                    n = self.dna_nb_scale
+                    bidx = self.scLJ_dna.addBond(
+                        i+offset,j+offset,
+                        [sig*unit.nanometer, lam*unit.dimensionless, n*unit.dimensionless])
+                    self.basebase_pairlist.append(
+                        [i+offset+1,j+offset+1,bidx,sig,lam,n]
+                    )
+                    exclusion_map.append([i+offset,j+offset])
+        return exclusion_map
+
+
+    def add_angles(self, offset):
+        exclusion_map = []
+        for i in range(0, self.nbeads-1):
+            for j in range(i, self.nbeads):
+                if self.angle_check(i,j):
+                    dna_pa = self.calc_angle(i,j)
+                    bidx = self.ha.addAngle(
+                        i+offset,i+2+offset,i+4+offset,
+                        dna_pa*unit.radian,
+                        self.dna_ka*unit.kilojoules_per_mole/(unit.radian**2))
+                    self.angle_list.append(
+                        [i+offset+1,i+2+offset+1,i+4+offset+1,bidx,dna_pa,self.dna_ka]
+                    )
+                    exclusion_map.append([i+offset,j+offset])
+        return exclusion_map
+
+    def init_restraint_force(self, eps_lj=None, cutoff_lj=None, eps_yu=None, k_yu=None):
+        self.cs = interactions.init_restraints(self.restraint_type)
+        self.restr_pairlist = []
+
+    def restraint_check(self, i: int, j: int):
+        """ restraint interactions conditions. """
+
+        #condition0 = (i%2 == 0) # phosphate
+        #condition1 = (j == i+2) # phosphate -- phosphate
+        #condition2 = (j == i+1) # phosphate -- base
+
+        bond_condition = self.bond_check(i,j)  #bond_condition = condition0 and (condition1 or condition2)
+        angle_condition = self.angle_check(i,j) #angle_condition = (i%2 == 0) and (j == i+4)
+        basebase_condition = self.basebase_check(i,j)  #basebase_condition = (i%2 == 1) and (j == i+2)
+        condition = (not bond_condition ) and (not angle_condition ) and (not basebase_condition )
+
+        condition_termini =  (i in self.c_termini) or (j in self.n_termini)
+
+        return condition or condition_termini
+
+    def add_restraints(self, offset, min_scale = 0.1):
+        """ Add restraints. """
+        exclusion_map = [] # for ah, yu etc.
+        for i in range(0,self.nbeads-2):
+            for j in range(i+2,self.nbeads):
+                if self.restraint_check(i, j):
+                    # check if below cutoff
+                    if self.dmap[i,j] > self.cutoff_restr:
+                        continue
+                    # harmonic
+                    if self.restraint_type == 'harmonic':
+                        ss = build.check_ssdomain(self.ssdomains,i,j,req_both=True)
+                        if not ss:
+                            continue
+                        k = self.k_harmonic
+                        self.cs, restr_pair = interactions.add_single_restraint(
+                            self.cs, self.restraint_type, self.dmap[i,j], k,
+                            i+offset, j+offset)
+                        self.restr_pairlist.append(restr_pair)
+                        exclusion_map.append([i+offset,j+offset])
+        return exclusion_map
+
+    def write_bonds(self, path):
+        """ Write bonds and angles to file. """
+
+        with open(f'{path}/bonds_{self.name}.txt','w') as f:
+            f.write('i\tj\tb_idx\td[nm]\tk[kJ/mol/nm^2]\n')
+            for b in self.bond_pairlist:
+                f.write(f'{int(b[0])}\t{int(b[1])}\t{int(b[2])}\t{b[3]:.4f}\t{b[4]:.4f}\n')
+
+        with open(f'{path}/basebase_{self.name}.txt','w') as f:
+            f.write('i\tj\tb_idx\tsig\tlam\tn\n')
+            for b in self.basebase_pairlist:
+                f.write(f'{int(b[0])}\t{int(b[1])}\t{int(b[2])}\t{b[3]:.4f}\t{b[4]:.4f}\t{b[5]}\n')
+
+        with open(f'{path}/angles_{self.name}.txt','w') as f:
+            f.write('i\tj\tk\ta_idx\ta[rad]\tk[kJ/mol/rad^2]\n')
+            for b in self.angle_list:
+                f.write(f'{int(b[0])}\t{int(b[1])}\t{int(b[2])}\t{int(b[3])}\t{b[4]:.4f}\t{b[5]:.4f}\n')
+
+    def write_restraints(self,path):
+        """ Write restraints to file. """
+
+        with open(f'{path}/restr_{self.name}.txt','w') as f:
+            f.write('i j d[nm] fc\n')
+            for r in self.restr_pairlist:
+                f.write(f'{int(r[0])} {int(r[1])} {r[2]:.4f} {r[3]:.4f}\n')
+
 class Lipid(Component):
     """ Component lipid. """
 

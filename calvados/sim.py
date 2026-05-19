@@ -69,6 +69,10 @@ class Sim:
                 # Crowder component
                 comp_setup = 'spiral'
                 comp = RNA(name, properties, self.comp_defaults)
+            elif molecule_type in ['dna']:
+                # Crowder component
+                comp_setup = 'spiral'
+                comp = DNA(name, properties, self.comp_defaults)
             elif molecule_type == 'cyclic':
                 comp_setup = 'compact'
                 comp = Cyclic(name, properties, self.comp_defaults)
@@ -117,6 +121,7 @@ class Sim:
         self.nproteins = np.sum([c.nmol if c.molecule_type == 'protein' else 0 for c in self.components])
         self.ncrowders = np.sum([c.nmol if c.molecule_type == 'crowder' else 0 for c in self.components])
         self.nrnas = np.sum([c.nmol if c.molecule_type == 'rna' else 0 for c in self.components])
+        self.ndnas = np.sum([c.nmol if c.molecule_type == 'dna' else 0 for c in self.components])
 
         if ((self.ncomponents > 1) or (self.nmolecules > 1)) and (self.topol in ['single', 'center']):
             raise ValueError("Topol 'center' incompatible with multiple molecules.")
@@ -169,8 +174,8 @@ class Sim:
 
         self.pos = []
 
-        if self.topol == 'slab': # proteins + rna
-            self.xyzgrid = build.build_xyzgrid(self.nproteins+self.nrnas,[self.box[0],self.box[1],self.slab_width])
+        if self.topol == 'slab': # proteins + rna +dna
+            self.xyzgrid = build.build_xyzgrid(self.nproteins+self.nrnas+self.ndnas,[self.box[0],self.box[1],self.slab_width])
             self.xyzgrid += np.asarray([0,0,self.box[2]/2.-self.slab_width/2.])
             if self.ncrowders > 0: # crowder
                 xyzgrid = build.build_xyzgrid(np.ceil(self.ncrowders/2.),[self.box[0],self.box[1],self.box[2]/2.-self.slab_outer])
@@ -180,13 +185,13 @@ class Sim:
             self.xyzgrid = build.build_xyzgrid(self.nmolecules,self.box)
         if self.nlipids > 0:
             self.bilayergrid = build.build_xygrid(int(self.nlipids*1.05),self.box)
-            if (self.nproteins + self.nrnas) > 0:
-                xyzgrid = build.build_xyzgrid(np.ceil((self.nproteins+self.nrnas)/2.),[self.box[0],self.box[1],self.box[2]/2.-self.box[0]])
+            if (self.nproteins + self.nrnas + self.drnas) > 0:
+                xyzgrid = build.build_xyzgrid(np.ceil((self.nproteins+self.nrnas+self.ndnas)/2.),[self.box[0],self.box[1],self.box[2]/2.-self.box[0]])
                 self.xyzgrid = np.append(xyzgrid, xyzgrid + np.asarray([0,0,self.box[2]/2.+self.box[0]]), axis=0)
         if self.ncookelipids > 0:
             self.bilayergrid = build.build_xygrid(int(self.ncookelipids*1.05),self.box)
-            if (self.nproteins + self.nrnas) > 0:
-                xyzgrid = build.build_xyzgrid(np.ceil((self.nproteins+self.nrnas)/2.),[self.box[0],self.box[1],self.box[2]/2.-self.box[0]])
+            if (self.nproteins + self.nrnas + self.ndnas) > 0:
+                xyzgrid = build.build_xyzgrid(np.ceil((self.nproteins+self.nrnas+self.ndnas)/2.),[self.box[0],self.box[1],self.box[2]/2.-self.box[0]])
                 self.xyzgrid = np.append(xyzgrid, xyzgrid + np.asarray([0,0,self.box[2]/2.+self.box[0]]), axis=0)
 
         for cidx, comp in enumerate(self.components):
@@ -203,6 +208,8 @@ class Sim:
                 elif comp.molecule_type in ['lipid','cooke_lipid']:
                     xs = self.place_bilayer(comp)
                 elif comp.molecule_type == 'rna':
+                    xs = self.place_molecule(comp)
+                elif comp.molecule_type == 'dna':
                     xs = self.place_molecule(comp)
                 self.add_interactions(comp)
 
@@ -388,7 +395,7 @@ class Sim:
                 self.ah.addParticle([sig*unit.nanometer, lam, 0])
             elif comp.molecule_type == 'crowder':
                 self.ah.addParticle([sig*unit.nanometer, lam, -1])
-            else: # protein, RNA
+            else: # protein, RNA, DNA
                 self.ah.addParticle([sig*unit.nanometer, lam, 1])
             if self.nlipids > 0 or self.ncookelipids > 0:
                 if comp.molecule_type in ['lipid', 'cooke_lipid']:
@@ -408,7 +415,7 @@ class Sim:
         # Add bonds
         self.add_bonds(comp, offset)
 
-        if comp.molecule_type == 'rna':
+        if comp.molecule_type in ['rna', 'dna']:
             self.add_angles(comp, offset)
 
         # Add restraints
@@ -434,7 +441,7 @@ class Sim:
         # Note: Move this to component eventually.
         chain = self.top.add_chain()
 
-        if comp.molecule_type == 'rna':
+        if comp.molecule_type in ['rna','dna']:
             for idx,resname in enumerate(comp.seq):
                 res = self.top.add_residue(resname, chain, resSeq=idx+1)
                 self.top.add_atom(resname+"P", element=md.element.phosphorus, residue=res)
